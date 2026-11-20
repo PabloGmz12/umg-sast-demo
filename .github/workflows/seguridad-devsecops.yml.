@@ -1,0 +1,136 @@
+# Pipeline DevSecOps de DEMOSTRACIÓN para el proyecto UMG Security Store.
+# Analiza el código público de WooCommerce 11.2.2 (el mismo que usa el laboratorio).
+# No es el repositorio del laboratorio: en el informe debe declararse como "pipeline demostrativo".
+# Recomendación: fijar cada acción por SHA de commit y no solo por etiqueta (riesgo de cadena de suministro).
+name: seguridad-devsecops
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 12 * * 1"   # cada lunes, revisión semanal de avisos nuevos
+
+permissions:
+  contents: read
+
+env:
+  WC_TAG: "11.2.2"                              # versión instalada en el laboratorio
+  WP_IMAGE: "wordpress:php8.3-apache"     # CONFIRMAR con 'docker compose images' de la VM
+  DB_IMAGE: "mysql:8.4"
+
+jobs:
+  sast:
+    name: SAST (Semgrep + PHPCS WordPress)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar código de WooCommerce (solo el plugin)
+        uses: actions/checkout@v4
+        with:
+          repository: woocommerce/woocommerce
+          ref: ${{ env.WC_TAG }}
+          path: wc
+          sparse-checkout: plugins/woocommerce
+      - name: Reglas de Semgrep
+        run: git clone --depth 1 https://github.com/semgrep/semgrep-rules.git semgrep-rules
+      - name: Semgrep
+        run: |
+          pip install semgrep
+          semgrep scan --config semgrep-rules/php --metrics=off --disable-version-check \
+            --include '*.php' --exclude tests --exclude vendor --exclude node_modules \
+            --json -o semgrep.json wc/plugins/woocommerce || true
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("semgrep.json"))
+          print(f"### Semgrep\nResultados brutos: **{len(d['results'])}** (requieren triaje manual)")
+          PY
+      - name: PHPCS con reglas de seguridad de WordPress
+        run: |
+          composer global config --no-plugins allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+          composer global require --quiet "wp-coding-standards/wpcs:^3.0" "dealerdirect/phpcodesniffer-composer-installer"
+          "$(composer global config bin-dir --absolute --quiet)/phpcs" --standard=WordPress-Extra \
+            --sniffs=WordPress.Security.NonceVerification,WordPress.Security.EscapeOutput,WordPress.DB.PreparedSQL,WordPress.Security.SafeRedirect \
+            --extensions=php --ignore='*/tests/*,*/vendor/*,*/node_modules/*' \
+            --report=json --report-file=phpcs.json wc/plugins/woocommerce || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resultados-sast
+          path: |
+            semgrep.json
+            phpcs.json
+
+  sca:
+    name: SCA (Trivy sobre composer.lock) + SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código de WooCommerce (solo el plugin)
+        uses: actions/checkout@v4
+        with:
+          repository: woocommerce/woocommerce
+          ref: ${{ env.WC_TAG }}
+          path: wc
+          sparse-checkout: plugins/woocommerce
+      - name: Dependencias con avisos HIGH/CRITICAL (puerta de control)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: wc/plugins/woocommerce
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"        # bloquea si hay HIGH o CRITICAL
+          format: table
+      - name: SBOM CycloneDX
+        uses: anchore/sbom-action@v0
+        with:
+          path: wc/plugins/woocommerce
+          format: cyclonedx-json
+          artifact-name: sbom-woocommerce.cdx.json
+
+  secretos:
+    name: Escaneo de secretos (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # incluye el historial para detectar secretos en commits viejos
+      - name: Descargar código de WooCommerce (solo el plugin)
+        uses: actions/checkout@v4
+        with:
+          repository: woocommerce/woocommerce
+          ref: ${{ env.WC_TAG }}
+          path: wc
+          sparse-checkout: plugins/woocommerce
+      - name: Gitleaks sobre el código de WooCommerce (solo informe)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --no-git --source /repo/wc/plugins/woocommerce --report-format json \
+            --report-path /repo/gitleaks-wc.json --exit-code 0
+      - name: Gitleaks sobre este repositorio con historial (puerta de control)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source /repo --report-format json --report-path /repo/gitleaks.json --exit-code 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resultados-secretos
+          path: |
+            gitleaks.json
+            gitleaks-wc.json
+
+  imagenes:
+    name: Imágenes de contenedor (Trivy, solo informe)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["wordpress:php8.3-apache", "mysql:8.4"]
+    steps:
+      - name: Escanear ${{ matrix.image }}
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ matrix.image }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"        # fase 1: solo informar; pasar a "1" cuando se triaje la línea base
+          format: table
