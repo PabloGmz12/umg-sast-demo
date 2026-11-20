@@ -73,7 +73,7 @@ jobs:
           path: wc
           sparse-checkout: plugins/woocommerce
       - name: Dependencias con avisos HIGH/CRITICAL (puerta de control)
-        uses: aquasecurity/trivy-action@v0.36.0.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: wc/plugins/woocommerce
@@ -128,7 +128,7 @@ jobs:
         image: ["wordpress:php8.3-apache", "mysql:8.4"]
     steps:
       - name: Escanear ${{ matrix.image }}
-        uses: aquasecurity/trivy-action@v0.36.0.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ matrix.image }}
           severity: HIGH,CRITICAL
